@@ -1,0 +1,20 @@
+{
+  "name": "acme-sdlc",
+  "owner": {
+    "name": "acme-sdlc"
+  },
+  "metadata": {
+    "description": "ACME overlay on the aisdlc harness",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "acme",
+      "source": "./plugins/acme",
+      "description": "Label-driven issue queue with File-scope safety gates for the upstream aisdlc runner",
+      "version": "0.1.0",
+      "strict": true,
+      "skills": ["./skills/acme-fleet-loop"]
+    }
+  ]
+}

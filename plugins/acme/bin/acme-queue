@@ -1,0 +1,218 @@
+#!/usr/bin/env node
+/**
+ * acme-queue — GitHub Issues as the work queue for unattended `aisdlc` runs.
+ *
+ *   acme-queue list [--all] [--json]   eligible leaves, best first (--all: every candidate + why not)
+ *   acme-queue check <n>               every gate for one issue
+ *   acme-queue scope <n>               the File scope globs
+ *   acme-queue spec <n>                print the spec `pull` would write
+ *   acme-queue pull [n] [--dry-run] [-- <aisdlc add flags>]
+ *                                      claim the best (or given) leaf, write specs/GH-<n>/spec.md,
+ *                                      queue it with upstream `aisdlc add GH-<n>`
+ *
+ * Options: --repo <path> (default .), --config <file> (default <repo>/.acme/project.json; every
+ * field has a default, so the file is optional). Exit: 0 ok, 1 nothing eligible / gate failed,
+ * 2 configuration or tracker error.
+ */
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { loadConfig, loadForbidden } from '../lib/config.mjs'
+import { byRank, eligible, gates, renderSpec, scopeGlobs } from '../lib/queue.mjs'
+
+function die(msg, code = 2) {
+  console.error(`acme-queue: ${msg}`)
+  process.exit(code)
+}
+
+// --- arguments ----------------------------------------------------------------------------
+const argv = process.argv.slice(2)
+const dashdash = argv.indexOf('--')
+const passThrough = dashdash === -1 ? [] : argv.slice(dashdash + 1)
+const args = dashdash === -1 ? argv : argv.slice(0, dashdash)
+const flag = (name) => {
+  const i = args.indexOf(name)
+  if (i === -1) return false
+  args.splice(i, 1)
+  return true
+}
+const option = (name) => {
+  const i = args.indexOf(name)
+  if (i === -1) return null
+  const v = args[i + 1]
+  if (!v) die(`${name} needs a value`)
+  args.splice(i, 2)
+  return v
+}
+const repo = resolve(option('--repo') ?? '.')
+const configOpt = option('--config')
+const all = flag('--all')
+const json = flag('--json')
+const dryRun = flag('--dry-run')
+const [command, numArg] = args
+
+// --- configuration ------------------------------------------------------------------------
+let remoteUrl = ''
+try {
+  remoteUrl = execFileSync('git', ['-C', repo, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+} catch {
+  // no origin: the config must name the repo
+}
+let project
+try {
+  project = loadConfig(repo, { file: configOpt ? resolve(configOpt) : undefined, remoteUrl })
+} catch (e) {
+  die(`invalid configuration:\n${e.message}`)
+}
+const q = project.queue
+
+// --- GitHub -------------------------------------------------------------------------------
+// The project may pin the gh account, so a machine logged into several accounts never queries
+// (or claims) with whichever one happens to be active.
+const ghEnv = { ...process.env }
+if (project.gh_user && !process.env.GH_TOKEN) {
+  try {
+    ghEnv.GH_TOKEN = execFileSync('gh', ['auth', 'token', '--user', project.gh_user], { encoding: 'utf8' }).trim()
+  } catch {
+    die(`gh has no token for ${project.gh_user} — run: gh auth login (as ${project.gh_user})`)
+  }
+}
+function gh(ghArgs) {
+  try {
+    return execFileSync('gh', ghArgs, { encoding: 'utf8', env: ghEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (e) {
+    die(`gh ${ghArgs.slice(0, 3).join(' ')} failed: ${(e.stderr || e.message).trim()}`)
+  }
+}
+const ghJson = (ghArgs) => JSON.parse(gh(ghArgs))
+const FIELDS = 'number,title,state,body,labels,assignees,url'
+const normalise = (i) => ({ ...i, labels: i.labels.map((l) => l.name), assignees: i.assignees.map((a) => a.login) })
+const issue = (n) => normalise(ghJson(['issue', 'view', String(n), '--repo', project.repo, '--json', FIELDS]))
+function candidates() {
+  const labelArgs = q.require_labels.flatMap((l) => ['--label', l])
+  return ghJson(['issue', 'list', '--repo', project.repo, '--state', 'open', '--limit', '500', ...labelArgs, '--json', FIELDS]).map(normalise)
+}
+
+// --- repository facts ---------------------------------------------------------------------
+const forbiddenList = () => loadForbidden(repo, q.forbidden_paths)
+
+// Same rule as the upstream runner: an issue that already became a task (any status) or has an
+// ai/GH-<n>-* branch is never taken twice.
+function alreadyBuilt(n) {
+  const tasks = join(repo, '.aisdlc/tasks')
+  if (existsSync(tasks)) {
+    for (const id of readdirSync(tasks)) {
+      const f = join(tasks, id, 'task.json')
+      if (existsSync(f) && JSON.parse(readFileSync(f, 'utf8')).ticket === `GH-${n}`) return true
+    }
+  }
+  const out = execFileSync('git', ['-C', repo, 'branch', '--all', '--list', `ai/GH-${n}-*`, '--list', `*/ai/GH-${n}-*`], { encoding: 'utf8' })
+  return out.trim().length > 0
+}
+
+const forbidden = await forbiddenList()
+const evaluate = (i) => gates(i, { queue: q, forbidden, built: alreadyBuilt(i.number) })
+
+function printGates(i, g) {
+  console.log(`#${i.number} ${i.title}`)
+  for (const x of g) console.log(`  ${x.ok ? '✓' : '✗'} ${x.gate.padEnd(18)} ${x.detail}`)
+  console.log(eligible(g) ? '  → eligible' : '  → not eligible')
+}
+
+function needNumber() {
+  if (!/^\d+$/.test(numArg ?? '')) die(`${command} needs an issue number`)
+  return Number(numArg)
+}
+
+// --- claim (compatible with the upstream runner's lock: label + assignee + comment) --------
+function me() {
+  return gh(['api', 'user', '--jq', '.login']).trim()
+}
+function claim(n) {
+  const login = me()
+  gh(['issue', 'edit', String(n), '--repo', project.repo, '--add-label', q.claim_label, '--add-assignee', login])
+  gh(['issue', 'comment', String(n), '--repo', project.repo, '--body', `🤖 acme-queue claimed ${new Date().toISOString().replace(/\.\d+Z$/, 'Z')}`])
+  const after = issue(n)
+  if (!after.labels.includes(q.claim_label) || !after.assignees.includes(login)) die(`claim on #${n} did not stick`)
+  return login
+}
+function release(n, login, reason) {
+  gh(['issue', 'edit', String(n), '--repo', project.repo, '--remove-label', q.claim_label, '--remove-assignee', login])
+  gh(['issue', 'comment', String(n), '--repo', project.repo, '--body', `🤖 acme-queue released: ${reason}`])
+}
+
+// --- commands -----------------------------------------------------------------------------
+switch (command) {
+  case 'list': {
+    const rows = candidates()
+      .map((i) => ({ i, g: evaluate(i) }))
+      .sort((a, b) => byRank(q.priority_labels)(a.i, b.i))
+    const ok = rows.filter((r) => eligible(r.g))
+    if (json) {
+      console.log(JSON.stringify((all ? rows : ok).map((r) => ({ number: r.i.number, title: r.i.title, eligible: eligible(r.g), failed: r.g.filter((x) => !x.ok) })), null, 2))
+    } else {
+      for (const r of all ? rows : ok) {
+        const why = r.g.filter((x) => !x.ok).map((x) => `${x.gate}: ${x.detail}`).join('; ')
+        console.log(`#${r.i.number}  ${r.i.title.slice(0, 88)}${why ? `\n      ✗ ${why}` : ''}`)
+      }
+      if (ok.length === 0) console.log(`No eligible leaf in ${project.repo} (wanted ${q.require_labels.join(' + ')}).`)
+    }
+    process.exit(ok.length ? 0 : 1)
+  }
+  case 'check': {
+    const i = issue(needNumber())
+    const g = evaluate(i)
+    printGates(i, g)
+    process.exit(eligible(g) ? 0 : 1)
+  }
+  case 'scope': {
+    console.log(scopeGlobs(issue(needNumber()).body, q.scope_section).join('\n'))
+    process.exit(0)
+  }
+  case 'spec': {
+    process.stdout.write(renderSpec(issue(needNumber()), q, q.approval_label))
+    process.exit(0)
+  }
+  case 'pull': {
+    let target
+    if (numArg) {
+      target = issue(needNumber())
+      const g = evaluate(target)
+      if (!eligible(g)) {
+        printGates(target, g)
+        process.exit(1)
+      }
+    } else {
+      target = candidates().filter((i) => eligible(evaluate(i))).sort(byRank(q.priority_labels))[0]
+      if (!target) {
+        console.log(`nothing to pull: no eligible leaf in ${project.repo}`)
+        process.exit(1)
+      }
+    }
+    const ticket = `GH-${target.number}`
+    const specDir = join(repo, q.specs_dir, ticket)
+    const addArgs = ['add', ticket, '--repo', repo, ...passThrough]
+    if (dryRun) {
+      console.log(`would pull #${target.number} ${target.title}`)
+      console.log(`  write ${join(q.specs_dir, ticket, 'spec.md')} (status: approved, approved-by: issue #${target.number} (label ${q.approval_label}))`)
+      console.log(`  run   ${q.runner} ${addArgs.join(' ')}`)
+      process.exit(0)
+    }
+    if (existsSync(join(specDir, 'spec.md'))) die(`${join(q.specs_dir, ticket, 'spec.md')} already exists — not overwriting`)
+    const login = claim(target.number)
+    mkdirSync(specDir, { recursive: true })
+    writeFileSync(join(specDir, 'spec.md'), renderSpec(target, q, q.approval_label))
+    const run = spawnSync(q.runner, addArgs, { stdio: 'inherit', env: ghEnv })
+    if (run.status !== 0) {
+      rmSync(specDir, { recursive: true, force: true })
+      release(target.number, login, `${q.runner} add failed (exit ${run.status ?? run.error?.code})`)
+      die(`${q.runner} add ${ticket} failed — claim released, spec removed`, 1)
+    }
+    console.log(`pulled #${target.number}: queued ${ticket}; next: ${q.runner} run --repo ${repo} --once`)
+    process.exit(0)
+  }
+  default:
+    console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(2, 18).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
+    process.exit(command ? 2 : 0)
+}

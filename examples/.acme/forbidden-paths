@@ -1,0 +1,24 @@
+# Paths an unattended change may never touch. One glob per line; `*` within a segment,
+# `**` across segments. Rules starting with `**/` name a kind of file anywhere.
+
+# Secrets and environment
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+
+# Schema: migrations are generated and serial
+**/migrations/**
+
+# CI, infrastructure, agent configuration
+.github/**
+.acme/**
+.claude/**
+Dockerfile
+docker-compose*.yml
+
+# Vendored code and lock files
+**/node_modules/**
+**/vendor/**
+**/package-lock.json
+**/composer.lock

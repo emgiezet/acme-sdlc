@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+/**
+ * acme-rules — put the ACME rules where agents read them.
+ *
+ *   acme-rules sync  [--repo <path>]   write <repo>/.claude/rules/acme.md; idempotent
+ *   acme-rules check [--repo <path>]   exit 1 when the copy is missing, stale or edited in place
+ *
+ * The copy carries a header with the plugin version and two sha256 sums, so `check` can tell
+ * "the plugin moved on" (re-sync) from "someone edited the copy" (take the edit upstream instead).
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { renderCopy, verifyCopy } from '../lib/rules.mjs'
+
+const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const version = JSON.parse(readFileSync(join(PLUGIN_ROOT, 'plugin.json'), 'utf8')).version
+const source = readFileSync(join(PLUGIN_ROOT, 'rules/acme.md'), 'utf8')
+
+const args = process.argv.slice(2)
+const ri = args.indexOf('--repo')
+const repo = resolve(ri === -1 ? '.' : args[ri + 1])
+const target = join(repo, '.claude/rules/acme.md')
+
+switch (args[0]) {
+  case 'sync': {
+    mkdirSync(dirname(target), { recursive: true })
+    const copy = renderCopy(source, version)
+    const unchanged = existsSync(target) && readFileSync(target, 'utf8') === copy
+    if (!unchanged) writeFileSync(target, copy)
+    console.log(`${unchanged ? 'up to date' : 'wrote'} ${target} (acme ${version})`)
+    break
+  }
+  case 'check': {
+    const result = existsSync(target) ? verifyCopy(readFileSync(target, 'utf8'), source) : { ok: false, reason: 'missing — run acme-rules sync' }
+    console.log(result.ok ? `ok ${target}` : `${target}: ${result.reason}`)
+    process.exit(result.ok ? 0 : 1)
+  }
+  default:
+    console.log('usage: acme-rules sync|check [--repo <path>]')
+    process.exit(args[0] ? 2 : 0)
+}

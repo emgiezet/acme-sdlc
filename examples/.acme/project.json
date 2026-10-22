@@ -1,0 +1,17 @@
+{
+  "repo": "owner/name",
+  "gh_user": "owner",
+  "queue": {
+    "require_labels": ["leaf", "fleet-ok", "status:ready"],
+    "exclude_labels": ["epic", "gated", "core-only", "blocked"],
+    "priority_labels": ["P0", "P1", "P2"],
+    "claim_label": "in-progress",
+    "approval_label": "status:ready",
+    "require_sections": ["File scope", "Acceptance criteria"],
+    "scope_section": "File scope",
+    "criteria_section": "Acceptance criteria",
+    "forbidden_paths": { "file": ".acme/forbidden-paths" },
+    "specs_dir": "specs",
+    "runner": "aisdlc"
+  }
+}
